@@ -58,16 +58,15 @@ class MainWindow:
         self.all_entries: list[PortEntry] = []
         self.auto_refresh = True
         self.refresh_interval = 2  # seconds
-        self._refresh_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
         self._debounce_id: str | None = None
 
-        # Build UI
+        # Build UI first — show window immediately
         self._build_toolbar()
         self._build_tree()
         self._build_statusbar()
 
-        # Start background workers
-        self.svc_resolver.refresh()  # Initial WMI load (sync — may take 1-2s)
+        # Start background workers (WMI refresh runs in thread, not blocking startup)
         self.svc_resolver.start()
         self._start_refresh_thread()
 
@@ -179,16 +178,20 @@ class MainWindow:
         self._refresh_thread.start()
 
     def _refresh_loop(self):
-        while True:
+        # Do an immediate first scan so data appears quickly
+        self._do_refresh()
+
+        while not self._stop_event.is_set():
             if self.auto_refresh:
                 self._do_refresh()
-            # Use sub-second sleep to respond quickly to interval/stop changes
-            for _ in range(self.refresh_interval * 10):
-                if not self.root.winfo_exists():
-                    return
-                time.sleep(0.1)
+            # Sub-second sleep to respond quickly to stop signal
+            self._stop_event.wait(self.refresh_interval)
+            if self._stop_event.is_set():
+                return
 
     def _do_refresh(self):
+        if self._stop_event.is_set():
+            return
         try:
             entries = self.scanner()
         except Exception as e:
@@ -204,8 +207,8 @@ class MainWindow:
             entry.process_name = proc_names.get(entry.pid, "")
             entry.services = self.svc_resolver.get(entry.pid)
 
-        # Update UI on main thread
-        self.root.after(0, lambda: self._update_treeview(entries))
+        if not self._stop_event.is_set():
+            self.root.after(0, lambda e=entries: self._update_treeview(e))
 
     def _update_treeview(self, entries: list[PortEntry]):
         self.all_entries = entries
@@ -218,10 +221,11 @@ class MainWindow:
 
     def _manual_refresh_bg(self):
         self._do_refresh()
-        self.root.after(0, lambda: (
-            self.status_var.set(f"刷新完成 — {time.strftime('%H:%M:%S')}"),
-            self.refresh_btn.configure(state="normal")
-        ))
+        if not self._stop_event.is_set():
+            self.root.after(0, lambda: (
+                self.status_var.set(f"刷新完成 — {time.strftime('%H:%M:%S')}"),
+                self.refresh_btn.configure(state="normal")
+            ))
 
     # ── Filtering ─────────────────────────────────────────────────
 
@@ -407,6 +411,7 @@ class MainWindow:
                 messagebox.showerror("错误", f"无法提升权限: {e}", parent=self.root)
 
     def _on_close(self):
+        self._stop_event.set()
         self.auto_refresh = False
         self.svc_resolver.stop()
         self.root.destroy()
